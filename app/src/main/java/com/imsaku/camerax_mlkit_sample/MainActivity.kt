@@ -9,75 +9,113 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.google.mlkit.common.MlKitException
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.common.InputImage
 import kotlinx.android.synthetic.main.activity_main.*
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 
-
+@ExperimentalGetImage
 class MainActivity : AppCompatActivity() {
-    private var preview: Preview? = null
-    private var imageCapture: ImageCapture? = null
-    private var camera: Camera? = null
+    private var previewView: PreviewView? = null
+    private var cameraSelector: CameraSelector? = null
+    private var cameraProvider: ProcessCameraProvider? = null
+    // camera usecases
+    private var previewUseCase: Preview? = null
+    private var barcodeScanUseCase: ImageAnalysis? = null
+    private var captureUseCase: ImageCapture? = null
 
     private lateinit var outputDirectory: File
-    private lateinit var cameraExecutor: ExecutorService
 
+    @ExperimentalGetImage
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        
+
+        previewView = view_finder
+
         if (allPermissionsGranted()) {
-            startCamera()
+            cameraSelector =
+                CameraSelector.Builder()
+                    .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+                    .build()
+            bindPreviewAndCaptureUseCase()
+            bindBarcodeScanUseCase()
         } else {
             ActivityCompat.requestPermissions(
                     this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
 
         camera_capture_button.setOnClickListener { takePhoto() }
-
         outputDirectory = getOutputDirectory()
 
-        cameraExecutor = Executors.newSingleThreadExecutor()
     }
 
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+    @ExperimentalGetImage
+    private fun bindBarcodeScanUseCase() {
+        if (cameraProvider == null) {
+            return
+        }
+        if (barcodeScanUseCase != null) {
+            cameraProvider!!.unbind(barcodeScanUseCase)
+        }
+        if (captureUseCase != null) {
+            cameraProvider!!.unbind(captureUseCase)
+        }
 
-        cameraProviderFuture.addListener(Runnable {
-            // カメラのlifecycleをlifecycle ownerへバインドするために使う
-            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
-
-            preview = Preview.Builder().build()
-
-            imageCapture = ImageCapture.Builder().build()
-
-            val cameraSelector = CameraSelector.Builder()
-                    .requireLensFacing(CameraSelector.LENS_FACING_BACK).build()
-
-            try {
-                // リバインドする前にuse caseのバインドを解除する
-                cameraProvider.unbindAll()
-
-                // カメラにuse caseをバインドする
-                camera = cameraProvider.bindToLifecycle(
-                        this, cameraSelector, preview, imageCapture)
-                preview?.setSurfaceProvider(viewFinder.createSurfaceProvider())
-            } catch (exception: Exception) {
-                Log.e(TAG, "Use case binding failed", exception)
+        val scanner = BarcodeScanning.getClient()
+        val builder = ImageAnalysis.Builder()
+        barcodeScanUseCase = builder.build()
+        barcodeScanUseCase?.setAnalyzer(
+            ContextCompat.getMainExecutor(this),
+            ImageAnalysis.Analyzer { imageProxy: ImageProxy ->
+                try {
+                    val inputImage = InputImage.fromMediaImage(
+                        imageProxy.image!!, imageProxy.imageInfo.rotationDegrees)
+                    scanner.process(inputImage)
+                        .addOnSuccessListener { barcodes ->
+                            if (barcodes.isEmpty()) {
+                                Log.d(TAG, "NO Barcode was detected")
+                            } else {
+                                Log.d(TAG, "Barcode was detected")
+                            }
+                            imageProxy.close()
+                        }
+                        .addOnFailureListener {
+                            Log.d(TAG, "Scan failed")
+                            imageProxy.close()
+                        }
+                } catch (e: MlKitException) {
+                    Log.e("", e.localizedMessage!!)
+                }
             }
-        }, ContextCompat.getMainExecutor(this))
+        )
+        cameraProvider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, barcodeScanUseCase)
+    }
 
+    private fun bindPreviewAndCaptureUseCase() {
+        val cameraProviderFeature = ProcessCameraProvider.getInstance(this)
+        cameraProvider = cameraProviderFeature.get()
 
+        cameraProviderFeature.addListener(Runnable {
+            if (previewUseCase != null) {
+                cameraProvider!!.unbind(previewUseCase)
+            }
+            previewUseCase = Preview.Builder().build()
+            captureUseCase = ImageCapture.Builder().build()
+            previewUseCase!!.setSurfaceProvider(previewView!!.createSurfaceProvider())
+            cameraProvider!!.bindToLifecycle(this, cameraSelector!!, previewUseCase, captureUseCase)
+        },
+        ContextCompat.getMainExecutor(applicationContext))
     }
 
     private fun takePhoto() {
-        // imageCaptureがnullの場合にreturnすることで、アプリのクラッシュを防ぐ
-        val imageCapture = imageCapture ?: return
+        val imageCapture = captureUseCase ?: return
 
         val photoFile = File(
                 outputDirectory,
@@ -123,7 +161,8 @@ class MainActivity : AppCompatActivity() {
             requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
             if (allPermissionsGranted()) {
-                startCamera()
+                bindPreviewAndCaptureUseCase()
+                bindBarcodeScanUseCase()
             } else {
                 Toast.makeText(this,
                         "Permissions not granted by the user.", Toast.LENGTH_SHORT).show()
